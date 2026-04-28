@@ -1,0 +1,210 @@
+//+------------------------------------------------------------------+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+//================ CONFIG =================//
+input double RiskPercent = 1.0;
+input int ATR_Period = 14;
+input double ATR_Min = 0.0005;
+input int RSI_Period = 14;
+input int StartHour = 8;
+input int EndHour = 18;
+input double MaxSpread = 20;
+input double DailyLossLimitPercent = 2.0;
+
+//================ CONTROLE =================//
+datetime lastTradeDay = 0;
+
+//================ FILTROS =================//
+
+bool IsNewTradeDay()
+{
+   datetime now = TimeCurrent();
+   if (TimeDay(now) != TimeDay(lastTradeDay))
+   {
+      lastTradeDay = now;
+      return true;
+   }
+   return false;
+}
+
+bool IsTradingTime()
+{
+   int hour = TimeHour(TimeCurrent());
+   return (hour >= StartHour && hour <= EndHour);
+}
+
+bool IsWeekday()
+{
+   int day = TimeDayOfWeek(TimeCurrent());
+   return (day >= 1 && day <= 5);
+}
+
+bool IsSpreadOK()
+{
+   double spread = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) -
+                    SymbolInfoDouble(_Symbol, SYMBOL_BID)) / _Point;
+
+   return spread <= MaxSpread;
+}
+
+bool IsVolumeStrong()
+{
+   long vol = iVolume(_Symbol, PERIOD_M15, 0);
+   long avg = 0;
+
+   for (int i = 1; i <= 10; i++)
+      avg += iVolume(_Symbol, PERIOD_M15, i);
+
+   avg /= 10;
+
+   return vol > avg;
+}
+
+bool HitDailyLossLimit()
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   double loss = (balance - equity) / balance * 100;
+
+   return loss >= DailyLossLimitPercent;
+}
+
+//================ CANDLE =================//
+
+bool IsPinBar()
+{
+   double open = iOpen(_Symbol, PERIOD_M15, 1);
+   double close = iClose(_Symbol, PERIOD_M15, 1);
+   double high = iHigh(_Symbol, PERIOD_M15, 1);
+   double low = iLow(_Symbol, PERIOD_M15, 1);
+
+   double body = MathAbs(close - open);
+   double upperWick = high - MathMax(open, close);
+   double lowerWick = MathMin(open, close) - low;
+
+   return (upperWick > body * 2 || lowerWick > body * 2);
+}
+
+bool IsBullishEngulfing()
+{
+   double open1 = iOpen(_Symbol, PERIOD_M15, 1);
+   double close1 = iClose(_Symbol, PERIOD_M15, 1);
+
+   double open2 = iOpen(_Symbol, PERIOD_M15, 2);
+   double close2 = iClose(_Symbol, PERIOD_M15, 2);
+
+   return (close1 > open1 && close2 < open2 && close1 > open2 && open1 < close2);
+}
+
+bool IsBearishEngulfing()
+{
+   double open1 = iOpen(_Symbol, PERIOD_M15, 1);
+   double close1 = iClose(_Symbol, PERIOD_M15, 1);
+
+   double open2 = iOpen(_Symbol, PERIOD_M15, 2);
+   double close2 = iClose(_Symbol, PERIOD_M15, 2);
+
+   return (close1 < open1 && close2 > open2 && close1 < open2 && open1 > close2);
+}
+
+//================ LOTE =================//
+
+double GetLotSize(double stopLossPoints)
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk = balance * (RiskPercent / 100.0);
+
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double lot = risk / (stopLossPoints * tickValue);
+
+   return NormalizeDouble(lot, 2);
+}
+
+//================ BREAK EVEN =================//
+
+void ApplyBreakEven()
+{
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if (!PositionSelectByTicket(ticket)) continue;
+
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl = PositionGetDouble(POSITION_SL);
+      double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+      double risk = MathAbs(openPrice - sl);
+
+      if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+      {
+         if (price - openPrice >= risk)
+            trade.PositionModify(ticket, openPrice, 0);
+      }
+
+      if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+      {
+         if (openPrice - price >= risk)
+            trade.PositionModify(ticket, openPrice, 0);
+      }
+   }
+}
+
+//================ MAIN =================//
+
+void OnTick()
+{
+   ApplyBreakEven();
+
+   if (!IsTradingTime()) return;
+   if (!IsWeekday()) return;
+   if (!IsSpreadOK()) return;
+   if (!IsVolumeStrong()) return;
+   if (HitDailyLossLimit()) return;
+   if (!IsNewTradeDay()) return;
+
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // ===== TREND H1 =====
+   double ema200 = iMA(_Symbol, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE, 0);
+
+   // ===== ENTRY M15 =====
+   double ema20 = iMA(_Symbol, PERIOD_M15, 20, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double rsi = iRSI(_Symbol, PERIOD_M15, RSI_Period, PRICE_CLOSE, 0);
+
+   double atr = iATR(_Symbol, PERIOD_M15, ATR_Period, 0);
+   if (atr < ATR_Min) return;
+
+   double stopLossPoints = atr * 2 / _Point;
+   double takeProfitPoints = atr * 3 / _Point;
+
+   double lot = GetLotSize(stopLossPoints);
+
+   bool buySignal = (price > ema200) &&
+                    (price <= ema20) &&
+                    (rsi < 40) &&
+                    (IsPinBar() || IsBullishEngulfing());
+
+   bool sellSignal = (price < ema200) &&
+                     (price >= ema20) &&
+                     (rsi > 60) &&
+                     (IsPinBar() || IsBearishEngulfing());
+
+   //================ BUY =================//
+   if (buySignal)
+   {
+      trade.Buy(lot, _Symbol, price,
+         price - stopLossPoints * _Point,
+         price + takeProfitPoints * _Point);
+   }
+
+   //================ SELL =================//
+   if (sellSignal)
+   {
+      trade.Sell(lot, _Symbol, price,
+         price + stopLossPoints * _Point,
+         price - takeProfitPoints * _Point);
+   }
+}

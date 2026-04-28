@@ -1,0 +1,284 @@
+
+//+------------------------------------------------------------------+
+//|                                              EA_Revisado_v2.mq5  |
+//|              Versão otimizada com melhorias reais de performance |
+//+------------------------------------------------------------------+
+#property strict
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+//================ CONFIG =================//
+input double RiskPercent          = 1.0;
+input int    ATR_Period           = 14;
+input double ATR_Min              = 0.0005;
+input int    StartHour            = 8;
+input int    EndHour              = 18;
+input double MaxSpread            = 20;
+input double DailyLossLimitPercent= 2.0;
+
+//================ HANDLES =================//
+int handleEMA200;
+int handleEMA20;
+int handleATR;
+
+//================ CONTROLE =================//
+datetime lastTradeDay      = 0;
+double   startOfDayBalance = 0;
+datetime lastBarTime       = 0;
+bool     alreadyTradedToday = false;
+
+//+------------------------------------------------------------------+
+//| OnInit                                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   handleEMA200 = iMA(_Symbol, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE);
+   handleEMA20  = iMA(_Symbol, PERIOD_M15, 20, 0, MODE_EMA, PRICE_CLOSE);
+   handleATR    = iATR(_Symbol, PERIOD_M15, ATR_Period);
+
+   if (handleEMA200 == INVALID_HANDLE ||
+       handleEMA20  == INVALID_HANDLE ||
+       handleATR    == INVALID_HANDLE)
+   {
+      Print("Erro ao criar indicadores.");
+      return INIT_FAILED;
+   }
+
+   startOfDayBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   IndicatorRelease(handleEMA200);
+   IndicatorRelease(handleEMA20);
+   IndicatorRelease(handleATR);
+}
+
+//================ FILTROS =================//
+
+bool IsTradingTime()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   return (dt.hour >= StartHour && dt.hour <= EndHour);
+}
+
+bool IsWeekday()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   return (dt.day_of_week >= 1 && dt.day_of_week <= 5);
+}
+
+bool IsSpreadOK()
+{
+   double spread = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) -
+                    SymbolInfoDouble(_Symbol, SYMBOL_BID)) / _Point;
+   return spread <= MaxSpread;
+}
+
+bool HitDailyLossLimit()
+{
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double loss   = (startOfDayBalance - equity) / startOfDayBalance * 100.0;
+   return loss >= DailyLossLimitPercent;
+}
+
+bool IsNewBar()
+{
+   datetime currentBar = iTime(_Symbol, PERIOD_M15, 0);
+   if (currentBar != lastBarTime)
+   {
+      lastBarTime = currentBar;
+      return true;
+   }
+   return false;
+}
+
+bool IsNewTradeDay()
+{
+   MqlDateTime now, last;
+   TimeToStruct(TimeCurrent(), now);
+   TimeToStruct(lastTradeDay, last);
+
+   if (now.day != last.day || now.mon != last.mon || now.year != last.year)
+   {
+      alreadyTradedToday = false;
+      startOfDayBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   }
+
+   return !alreadyTradedToday;
+}
+
+//================ CANDLE =================//
+
+bool IsBullishEngulfing()
+{
+   double open1  = iOpen (_Symbol, PERIOD_M15, 1);
+   double close1 = iClose(_Symbol, PERIOD_M15, 1);
+   double open2  = iOpen (_Symbol, PERIOD_M15, 2);
+   double close2 = iClose(_Symbol, PERIOD_M15, 2);
+
+   return (close1 > open1 && close2 < open2 &&
+           close1 > open2 && open1 < close2);
+}
+
+bool IsBearishEngulfing()
+{
+   double open1  = iOpen (_Symbol, PERIOD_M15, 1);
+   double close1 = iClose(_Symbol, PERIOD_M15, 1);
+   double open2  = iOpen (_Symbol, PERIOD_M15, 2);
+   double close2 = iClose(_Symbol, PERIOD_M15, 2);
+
+   return (close1 < open1 && close2 > open2 &&
+           close1 < open2 && open1 > close2);
+}
+
+//================ LOTE =================//
+
+double GetLotSize(double stopLossPoints)
+{
+   double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk     = balance * (RiskPercent / 100.0);
+   double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+
+   if (tickVal <= 0 || stopLossPoints <= 0) return 0;
+
+   double lot     = risk / (stopLossPoints * tickVal);
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double step    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+   lot = MathRound(lot / step) * step;
+
+   return NormalizeDouble(lot, 2);
+}
+
+//================ BREAK EVEN =================//
+
+void ApplyBreakEven()
+{
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if (!PositionSelectByTicket(ticket)) continue;
+
+      if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl        = PositionGetDouble(POSITION_SL);
+      double tp        = PositionGetDouble(POSITION_TP);
+      double price     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+      double risk = MathAbs(openPrice - sl);
+      if (risk <= 0) continue;
+
+      long type = PositionGetInteger(POSITION_TYPE);
+
+      if (type == POSITION_TYPE_BUY && sl < openPrice)
+      {
+         if (price - openPrice >= risk * 1.5)
+            trade.PositionModify(ticket, openPrice, tp);
+      }
+
+      if (type == POSITION_TYPE_SELL && sl > openPrice)
+      {
+         if (openPrice - price >= risk * 1.5)
+            trade.PositionModify(ticket, openPrice, tp);
+      }
+   }
+}
+
+//================ INDICADORES =================//
+
+bool GetIndicators(double &ema200, double &ema20, double &atr)
+{
+   double b1[], b2[], b3[];
+
+   if (CopyBuffer(handleEMA200, 0, 1, 1, b1) <= 0) return false;
+   if (CopyBuffer(handleEMA20,  0, 1, 1, b2) <= 0) return false;
+   if (CopyBuffer(handleATR,    0, 1, 1, b3) <= 0) return false;
+
+   ema200 = b1[0];
+   ema20  = b2[0];
+   atr    = b3[0];
+
+   return true;
+}
+
+//================ MAIN =================//
+
+void OnTick()
+{
+   ApplyBreakEven();
+
+   if (!IsTradingTime()) return;
+   if (!IsWeekday()) return;
+   if (!IsSpreadOK()) return;
+   if (HitDailyLossLimit()) return;
+
+   if (!IsNewBar()) return;
+   if (!IsNewTradeDay()) return;
+
+   double ema200, ema20, atr;
+   if (!GetIndicators(ema200, ema20, atr)) return;
+   if (atr < ATR_Min) return;
+
+   // Tendência (inclinação)
+   double emaPrev[];
+   if (CopyBuffer(handleEMA200, 0, 1, 2, emaPrev) <= 0) return;
+
+   bool trendUp = emaPrev[0] > emaPrev[1];
+   bool trendDown = emaPrev[0] < emaPrev[1];
+
+   // Filtro de lateralidade (ESSENCIAL)
+   double trendStrength = MathAbs(ema200 - ema20);
+   if (trendStrength < atr * 0.7) return;
+
+   double close1 = iClose(_Symbol, PERIOD_M15, 1);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   double slPoints = atr * 2 / _Point;
+   double tpPoints = atr * 3 / _Point;
+
+   double lot = GetLotSize(slPoints);
+   if (lot <= 0) return;
+
+   bool buySignal = (close1 > ema200) &&
+                    (close1 <= ema20) &&
+                    trendUp &&
+                    IsBullishEngulfing();
+
+   bool sellSignal = (close1 < ema200) &&
+                     (close1 >= ema20) &&
+                     trendDown &&
+                     IsBearishEngulfing();
+
+   if (buySignal)
+   {
+      double sl = ask - slPoints * _Point;
+      double tp = ask + tpPoints * _Point;
+
+      if (trade.Buy(lot, _Symbol, ask, sl, tp))
+      {
+         lastTradeDay = TimeCurrent();
+         alreadyTradedToday = true;
+      }
+   }
+   else if (sellSignal)
+   {
+      double sl = bid + slPoints * _Point;
+      double tp = bid - tpPoints * _Point;
+
+      if (trade.Sell(lot, _Symbol, bid, sl, tp))
+      {
+         lastTradeDay = TimeCurrent();
+         alreadyTradedToday = true;
+      }
+   }
+}
+//+------------------------------------------------------------------+

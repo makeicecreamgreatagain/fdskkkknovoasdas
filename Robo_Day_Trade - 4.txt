@@ -1,0 +1,424 @@
+
+//+------------------------------------------------------------------+
+//|                                               EA_Reformulado.mq5 |
+//|                     EA Day Trade Forex — Versão Reformulada       |
+//|                     M15 | Alta Seletividade | 1 Trade por Dia     |
+//+------------------------------------------------------------------+
+#property strict
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+//================ CONFIG =================//
+input double RiskPercent            = 1.0;    // Risco por trade (% da conta)
+input int    ATR_Period              = 14;     // Período do ATR
+input double ATR_Min                 = 0.0003; // ATR mínimo para operar (filtro de volatilidade)
+input double ATR_SL_Mult             = 1.5;   // Multiplicador do ATR para Stop Loss
+input double ATR_TP_Mult             = 2.5;   // Multiplicador do ATR para Take Profit
+input int    RSI_Period              = 14;     // Período do RSI
+input int    ADX_Period              = 14;     // Período do ADX
+input double ADX_Min                 = 20.0;  // ADX mínimo para operar (filtra lateralização)
+input int    StartHour               = 9;     // Hora de início das operações
+input int    EndHour                 = 17;    // Hora de fim das operações
+input int    SpikeBarsAfterOpen      = 2;     // Barras de espera após abertura de Londres/NY
+input double MaxSpread               = 15.0;  // Spread máximo em pontos
+input double DailyLossLimitPercent   = 2.0;   // Limite de perda diária (% da conta)
+
+//================ HANDLES =================//
+int handleEMA200_H1;   // Tendência primária (H1)
+int handleEMA200_M15;  // Tendência secundária (M15)
+int handleEMA50_M15;   // Pullback principal (M15)
+int handleRSI;
+int handleATR;
+int handleADX;
+
+//================ CONTROLE =================//
+datetime lastTradeDay      = 0;
+double   startOfDayBalance = 0;
+datetime lastBarTime       = 0;
+
+//+------------------------------------------------------------------+
+//| OnInit                                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   handleEMA200_H1  = iMA(_Symbol, PERIOD_H1,  200, 0, MODE_EMA, PRICE_CLOSE);
+   handleEMA200_M15 = iMA(_Symbol, PERIOD_M15, 200, 0, MODE_EMA, PRICE_CLOSE);
+   handleEMA50_M15  = iMA(_Symbol, PERIOD_M15, 50,  0, MODE_EMA, PRICE_CLOSE);
+   handleRSI        = iRSI(_Symbol, PERIOD_M15, RSI_Period, PRICE_CLOSE);
+   handleATR        = iATR(_Symbol, PERIOD_M15, ATR_Period);
+   handleADX        = iADX(_Symbol, PERIOD_M15, ADX_Period);
+
+   if (handleEMA200_H1  == INVALID_HANDLE ||
+       handleEMA200_M15 == INVALID_HANDLE ||
+       handleEMA50_M15  == INVALID_HANDLE ||
+       handleRSI        == INVALID_HANDLE ||
+       handleATR        == INVALID_HANDLE ||
+       handleADX        == INVALID_HANDLE)
+   {
+      Print("Erro ao criar handles dos indicadores.");
+      return INIT_FAILED;
+   }
+
+   startOfDayBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   trade.SetComment("EA_Reformulado");
+
+   Print("EA iniciado. Balance de referência: ", startOfDayBalance);
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| OnDeinit                                                         |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   IndicatorRelease(handleEMA200_H1);
+   IndicatorRelease(handleEMA200_M15);
+   IndicatorRelease(handleEMA50_M15);
+   IndicatorRelease(handleRSI);
+   IndicatorRelease(handleATR);
+   IndicatorRelease(handleADX);
+}
+
+//================ LEITURA DE INDICADORES =================//
+
+bool GetIndicatorValues(double &ema200h1, double &ema200m15, double &ema50,
+                        double &rsi, double &atr, double &adx)
+{
+   double b200h1[], b200m15[], b50[], bRSI[], bATR[], bADX[];
+
+   if (CopyBuffer(handleEMA200_H1,  0, 0, 1, b200h1)  <= 0) return false;
+   if (CopyBuffer(handleEMA200_M15, 0, 0, 1, b200m15) <= 0) return false;
+   if (CopyBuffer(handleEMA50_M15,  0, 0, 1, b50)     <= 0) return false;
+   if (CopyBuffer(handleRSI,        0, 0, 1, bRSI)    <= 0) return false;
+   if (CopyBuffer(handleATR,        0, 0, 1, bATR)    <= 0) return false;
+   if (CopyBuffer(handleADX,        0, 0, 1, bADX)    <= 0) return false;
+
+   ema200h1  = b200h1[0];
+   ema200m15 = b200m15[0];
+   ema50     = b50[0];
+   rsi       = bRSI[0];
+   atr       = bATR[0];
+   adx       = bADX[0];
+
+   return true;
+}
+
+//================ FILTROS =================//
+
+bool IsNewTradeDay()
+{
+   MqlDateTime now, last;
+   TimeToStruct(TimeCurrent(), now);
+   TimeToStruct(lastTradeDay,  last);
+
+   return (now.day != last.day || now.mon != last.mon || now.year != last.year);
+}
+
+bool IsTradingTime()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   return (dt.hour >= StartHour && dt.hour < EndHour);
+}
+
+bool IsWeekday()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   return (dt.day_of_week >= 1 && dt.day_of_week <= 5);
+}
+
+bool IsSpreadOK()
+{
+   double spread = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) -
+                    SymbolInfoDouble(_Symbol, SYMBOL_BID)) / _Point;
+   return spread <= MaxSpread;
+}
+
+// Evita operar nas primeiras barras após abertura de Londres (9h) e Nova York (14h)
+// — momentos com spike e spread alto.
+bool IsAfterSessionSpike()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+
+   bool londonOpen = (dt.hour == StartHour);
+   bool nyOpen     = (dt.hour == 14);
+
+   if (!londonOpen && !nyOpen) return false;
+
+   // Conta barras desde o início da hora
+   int minutesIntoHour = dt.min;
+   int barsIntoHour    = minutesIntoHour / 15;
+
+   return (barsIntoHour < SpikeBarsAfterOpen);
+}
+
+bool IsVolumeStrong()
+{
+   long vol = iVolume(_Symbol, PERIOD_M15, 0);
+   long avg = 0;
+   for (int i = 1; i <= 10; i++)
+      avg += iVolume(_Symbol, PERIOD_M15, i);
+   avg /= 10;
+   return vol > avg;
+}
+
+bool HitDailyLossLimit()
+{
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double loss   = (startOfDayBalance - equity) / startOfDayBalance * 100.0;
+   return loss >= DailyLossLimitPercent;
+}
+
+bool IsNewBar()
+{
+   datetime currentBar = iTime(_Symbol, PERIOD_M15, 0);
+   if (currentBar != lastBarTime)
+   {
+      lastBarTime = currentBar;
+      return true;
+   }
+   return false;
+}
+
+//================ PADRÕES DE CANDLE =================//
+
+// Pin Bar com pavio mínimo 3x o corpo (mais rígido que a versão anterior)
+bool IsPinBar()
+{
+   double open  = iOpen (_Symbol, PERIOD_M15, 1);
+   double close = iClose(_Symbol, PERIOD_M15, 1);
+   double high  = iHigh (_Symbol, PERIOD_M15, 1);
+   double low   = iLow  (_Symbol, PERIOD_M15, 1);
+
+   double body      = MathAbs(close - open);
+   double upperWick = high - MathMax(open, close);
+   double lowerWick = MathMin(open, close) - low;
+
+   // Corpo muito pequeno pode dividir por zero — protege
+   if (body < _Point) return false;
+
+   return (upperWick > body * 3.0 || lowerWick > body * 3.0);
+}
+
+// Engolfo exige fechamento além da metade do candle anterior
+bool IsBullishEngulfing()
+{
+   double open1  = iOpen (_Symbol, PERIOD_M15, 1);
+   double close1 = iClose(_Symbol, PERIOD_M15, 1);
+   double open2  = iOpen (_Symbol, PERIOD_M15, 2);
+   double close2 = iClose(_Symbol, PERIOD_M15, 2);
+
+   double midpoint2 = (open2 + close2) / 2.0;
+
+   return (close1 > open1   &&   // candle 1 é de alta
+           close2 < open2   &&   // candle 2 é de baixa
+           open1  < close2  &&   // abre dentro do candle 2
+           close1 > open2   &&   // fecha além da abertura do candle 2
+           close1 > midpoint2 + (open2 - close2) * 0.5); // além da metade
+}
+
+bool IsBearishEngulfing()
+{
+   double open1  = iOpen (_Symbol, PERIOD_M15, 1);
+   double close1 = iClose(_Symbol, PERIOD_M15, 1);
+   double open2  = iOpen (_Symbol, PERIOD_M15, 2);
+   double close2 = iClose(_Symbol, PERIOD_M15, 2);
+
+   double midpoint2 = (open2 + close2) / 2.0;
+
+   return (close1 < open1   &&   // candle 1 é de baixa
+           close2 > open2   &&   // candle 2 é de alta
+           open1  > close2  &&   // abre dentro do candle 2
+           close1 < open2   &&   // fecha além da abertura do candle 2
+           close1 < midpoint2 - (close2 - open2) * 0.5); // além da metade
+}
+
+// Inside Bar: candle 1 contido dentro do candle 2 (compressão)
+// O sinal é dado pelo rompimento — verificado pelo close1 vs high/low do inside bar
+bool IsBullishInsideBarBreakout()
+{
+   double high1 = iHigh(_Symbol, PERIOD_M15, 1);
+   double low1  = iLow (_Symbol, PERIOD_M15, 1);
+   double high2 = iHigh(_Symbol, PERIOD_M15, 2);
+   double low2  = iLow (_Symbol, PERIOD_M15, 2);
+   double close1 = iClose(_Symbol, PERIOD_M15, 1);
+
+   bool isInsideBar = (high1 < high2 && low1 > low2);
+   return isInsideBar && (close1 > high2);
+}
+
+bool IsBearishInsideBarBreakout()
+{
+   double high1 = iHigh(_Symbol, PERIOD_M15, 1);
+   double low1  = iLow (_Symbol, PERIOD_M15, 1);
+   double high2 = iHigh(_Symbol, PERIOD_M15, 2);
+   double low2  = iLow (_Symbol, PERIOD_M15, 2);
+   double close1 = iClose(_Symbol, PERIOD_M15, 1);
+
+   bool isInsideBar = (high1 < high2 && low1 > low2);
+   return isInsideBar && (close1 < low2);
+}
+
+//================ LOTE =================//
+
+double GetLotSize(double stopLossPoints)
+{
+   double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk     = balance * (RiskPercent / 100.0);
+   double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+
+   if (tickVal <= 0 || stopLossPoints <= 0) return 0;
+
+   double lot     = risk / (stopLossPoints * tickVal);
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+   lot = MathRound(lot / lotStep) * lotStep;
+
+   return NormalizeDouble(lot, 2);
+}
+
+//================ BREAK EVEN =================//
+
+void ApplyBreakEven()
+{
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if (!PositionSelectByTicket(ticket)) continue;
+      if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl        = PositionGetDouble(POSITION_SL);
+      double tp        = PositionGetDouble(POSITION_TP);
+      double bid       = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double risk      = MathAbs(openPrice - sl);
+
+      if (risk <= 0) continue;
+
+      long posType = PositionGetInteger(POSITION_TYPE);
+
+      if (posType == POSITION_TYPE_BUY && sl < openPrice)
+      {
+         if (bid - openPrice >= risk)
+            trade.PositionModify(ticket, openPrice, tp);
+      }
+      else if (posType == POSITION_TYPE_SELL && sl > openPrice)
+      {
+         if (openPrice - bid >= risk)
+            trade.PositionModify(ticket, openPrice, tp);
+      }
+   }
+}
+
+//================ MAIN =================//
+
+void OnTick()
+{
+   // Break-even roda em todo tick
+   ApplyBreakEven();
+
+   // Filtros de sessão
+   if (!IsTradingTime())       return;
+   if (!IsWeekday())           return;
+   if (!IsSpreadOK())          return;
+   if (IsAfterSessionSpike())  return;
+   if (!IsVolumeStrong())      return;
+   if (HitDailyLossLimit())    return;
+
+   // Só processa na abertura de nova barra M15
+   if (!IsNewBar()) return;
+
+   // Já operou hoje?
+   if (!IsNewTradeDay()) return;
+
+   // Lê indicadores
+   double ema200h1, ema200m15, ema50, rsi, atr, adx;
+   if (!GetIndicatorValues(ema200h1, ema200m15, ema50, rsi, atr, adx)) return;
+
+   // Filtro de volatilidade (ATR mínimo)
+   if (atr < ATR_Min) return;
+
+   // Filtro de tendência (ADX mínimo — bloqueia lateralização)
+   if (adx < ADX_Min) return;
+
+   double stopLossPoints   = atr * ATR_SL_Mult / _Point;
+   double takeProfitPoints = atr * ATR_TP_Mult / _Point;
+
+   // Verifica RR mínimo de 1:1.5
+   if (takeProfitPoints / stopLossPoints < 1.5) return;
+
+   double lot = GetLotSize(stopLossPoints);
+   if (lot <= 0) return;
+
+   // Usa fechamento do candle anterior para os sinais de tendência
+   double close1 = iClose(_Symbol, PERIOD_M15, 1);
+
+   // ===== CONDIÇÕES DE TENDÊNCIA =====
+   // Dupla confirmação: H1 e M15 devem estar alinhados
+   bool trendUp   = (close1 > ema200h1 && close1 > ema200m15);
+   bool trendDown = (close1 < ema200h1 && close1 < ema200m15);
+
+   // ===== PULLBACK =====
+   // Preço deve ter recuado até a EMA 50 (zona de pullback)
+   bool pullbackBuy  = (close1 <= ema50 * 1.001); // tolerância de 0.1%
+   bool pullbackSell = (close1 >= ema50 * 0.999);
+
+   // ===== MOMENTUM (RSI) =====
+   // Banda estreita: confirma direção sem ser restritivo demais
+   bool momentumBuy  = (rsi < 45);
+   bool momentumSell = (rsi > 55);
+
+   // ===== PADRÃO DE CANDLE =====
+   bool candleBuy  = (IsPinBar() || IsBullishEngulfing() || IsBullishInsideBarBreakout());
+   bool candleSell = (IsPinBar() || IsBearishEngulfing() || IsBearishInsideBarBreakout());
+
+   // ===== SINAIS FINAIS =====
+   bool buySignal  = trendUp   && pullbackBuy  && momentumBuy  && candleBuy;
+   bool sellSignal = trendDown && pullbackSell && momentumSell && candleSell;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   //================ BUY =================//
+   if (buySignal)
+   {
+      double sl = ask - stopLossPoints   * _Point;
+      double tp = ask + takeProfitPoints * _Point;
+
+      if (trade.Buy(lot, _Symbol, ask, sl, tp))
+      {
+         lastTradeDay = TimeCurrent();
+         PrintFormat("BUY aberto | Lot: %.2f | SL: %.5f | TP: %.5f | ADX: %.1f | RSI: %.1f",
+                     lot, sl, tp, adx, rsi);
+      }
+   }
+
+   //================ SELL =================//
+   else if (sellSignal)
+   {
+      double sl = bid + stopLossPoints   * _Point;
+      double tp = bid - takeProfitPoints * _Point;
+
+      if (trade.Sell(lot, _Symbol, bid, sl, tp))
+      {
+         lastTradeDay = TimeCurrent();
+         PrintFormat("SELL aberto | Lot: %.2f | SL: %.5f | TP: %.5f | ADX: %.1f | RSI: %.1f",
+                     lot, sl, tp, adx, rsi);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Atualiza balance de referência a cada novo dia                   |
+//+------------------------------------------------------------------+
+void OnTrade()
+{
+   if (IsNewTradeDay())
+      startOfDayBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+}
+//+------------------------------------------------------------------+
